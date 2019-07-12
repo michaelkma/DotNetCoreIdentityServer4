@@ -1,109 +1,118 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
-using BankOfDotNetIdentityServer4.API.Models;
-using Microsoft.AspNetCore.Authorization;
+using IdentityServer4.EntityFramework.DbContexts;
+using IdentityServer4.EntityFramework.Mappers;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using Swashbuckle.AspNetCore.Swagger;
-using Swashbuckle.AspNetCore.SwaggerGen;
 
-namespace BankOfDotNetIdentityServer4.API
+namespace BankOfDotNet.IdentitySvr
 {
     public class Startup
     {
-        public Startup(IConfiguration configuration)
-        {
-            Configuration = configuration;
-        }
-
-        public IConfiguration Configuration { get; }
-
         // This method gets called by the runtime. Use this method to add services to the container.
+        // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
         public void ConfigureServices(IServiceCollection services)
         {
-            services.AddAuthentication("Bearer")
-                .AddIdentityServerAuthentication(options =>
+            services.AddMvc();
+
+            var config = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appSettings.json", false)
+                .Build();
+
+            string connectionString = config.GetSection("connectionString").Value;
+            var migrationAssembly = typeof(Startup).GetTypeInfo().Assembly.GetName().Name;
+
+            services.AddIdentityServer()
+                .AddDeveloperSigningCredential()
+                //.AddInMemoryIdentityResources(Config.GetIdentityResources())
+                //.AddInMemoryApiResources(Config.GetAllApiResources())
+                //.AddInMemoryClients(Config.GetClients())
+                .AddTestUsers(Config.GetUsers())
+
+                //Configuration Store: clients and resources
+                .AddConfigurationStore(options =>
                 {
-                    options.Authority = "http://localhost:5000";
-                    options.RequireHttpsMetadata = false;
-                    options.ApiName = "bankOfDotNetIdentityServer4Api";
-                });
-
-            services.AddDbContext<BankContext>(opts =>
-                opts.UseInMemoryDatabase("BankingDb"));
-
-            services.AddMvc().SetCompatibilityVersion(CompatibilityVersion.Version_2_2);
-
-            services.AddSwaggerGen(options =>
-            {
-                options.SwaggerDoc("v1", new Info { Title = "BankOfDotNet API", Version = "v1" });
-                options.OperationFilter<CheckAuthorizeOperationFilter>();
-
-                options.AddSecurityDefinition("oauth2", new OAuth2Scheme
+                    options.ConfigureDbContext = b =>
+                        b.UseSqlServer(connectionString,
+                            sql => sql.MigrationsAssembly(migrationAssembly));
+                })
+                //Operational Store: tokens, consents, codes, etc
+                .AddOperationalStore(options =>
                 {
-                    Type = "oauth2",
-                    Flow = "implicit",
-                    AuthorizationUrl = "http://localhost:5000/connect/authorize",
-                    Scopes = new Dictionary<string, string>()
-                    {
-                        {"bankOfDotNetIdentityServer4Api", "Cusomter API for BankOfDotNet" }
-                    }
+                    options.ConfigureDbContext = b =>
+                        b.UseSqlServer(connectionString,
+                            sql => sql.MigrationsAssembly(migrationAssembly));
                 });
-            });
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
         public void Configure(IApplicationBuilder app, IHostingEnvironment env)
         {
+            //Commenting out the following line because we have this already initialized.
+            //InitializeIdentityServerDatabase(app);
+
             if (env.IsDevelopment())
             {
                 app.UseDeveloperExceptionPage();
             }
 
-            app.UseAuthentication();
+            app.UseIdentityServer();
 
-            app.UseMvc();
-
-            app.UseSwagger();
-
-            app.UseSwaggerUI(options =>
-            {
-                options.SwaggerEndpoint("/swagger/v1/swagger.json", "BankOfDotNet API V1");
-                options.OAuthClientId("swaggerapiui");
-                options.OAuthAppName("Swagger API UI");
-            });
+            app.UseStaticFiles();
+            app.UseMvcWithDefaultRoute();
         }
-    }
 
-    internal class CheckAuthorizeOperationFilter : IOperationFilter
-    {
-        public void Apply(Operation operation, OperationFilterContext context)
+        private void InitializeIdentityServerDatabase(IApplicationBuilder app)
         {
-            //Check for any existing Authorize attribute
-            var authorizeAttributeExists = context.ApiDescription.ControllerAttributes().OfType<AuthorizeAttribute>().Any()
-                || context.ApiDescription.ActionAttributes().OfType<AuthorizeAttribute>().Any();
-
-            if(authorizeAttributeExists)
+            using (var serviceScope = app.ApplicationServices.GetService<IServiceScopeFactory>().CreateScope())
             {
-                operation.Responses.Add("401", new Response { Description = "Unathorized" });
-                operation.Responses.Add("403", new Response { Description = "Forbidden" });
-                operation.Security = new List<IDictionary<string, IEnumerable<string>>>();
-                operation.Security.Add(new Dictionary<string, IEnumerable<string>>
+                //Comment out the lines 78 and 81 (the lines that call the Migrate method) if the tables in the sql databases have already been created.
+                //serviceScope.ServiceProvider.GetRequiredService<PersistedGrantDbContext>().Database.Migrate();
+
+                var context = serviceScope.ServiceProvider.GetRequiredService<ConfigurationDbContext>();
+                //context.Database.Migrate();
+
+                //Seed the data
+                //seed the clients
+                if(context.Clients.Any())
                 {
-                    {"oauth2", new[]{"bankOfDotNetApi"} }
+                    foreach(var client in Config.GetClients().Where(c => c.ClientId == "swaggerapiui"))
+                    {
+                        context.Clients.Add(client.ToEntity());
+
+                    }
+                    context.SaveChanges();
                 }
-                );
+
+                //seed the identity resources
+                if (!context.IdentityResources.Any())
+                {
+                    foreach (var resource in Config.GetIdentityResources())
+                    {
+                        context.IdentityResources.Add(resource.ToEntity());
+                    }
+                    context.SaveChanges();
+                }
+
+                //seed the api resources
+                if (!context.ApiResources.Any())
+                {
+                    foreach (var resource in Config.GetAllApiResources())
+                    {
+                        context.ApiResources.Add(resource.ToEntity());
+                    }
+                    context.SaveChanges();
+                }
             }
         }
     }
-  
-
 }
